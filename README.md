@@ -1,3 +1,47 @@
+[Unit]
+Description=adpBetty GitHub Mirror, Zstd Seal, and Vault Verification
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/adpbetty
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash /opt/adpbetty/pipelines/mirror_and_seal_github.sh /var/lib/adpbetty/github-mirrors /var/lib/adpbetty/vault
+ExecStart=/bin/bash /opt/adpbetty/pipelines/verify_vault_archives.sh /var/lib/adpbetty/vault
+
+# Hardening & isolation
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/adpbetty /root/.ssh /root/.config/gh
+StandardOutput=journal
+StandardError=journal
+[Unit]
+Description=Daily Timer for adpBetty GitHub Mirror and Vault Verification
+Requires=adpbetty-github-vault.service
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=adpbetty-github-vault.service
+
+[Install]
+WantedBy=timers.target
+sudo systemctl daemon-reload
+sudo systemctl enable --now adpbetty-github-vault.timer
+
+# Inspect timer schedule and last run status
+sudo systemctl list-timers adpbetty-github-vault.timer
+sudo systemctl status adpbetty-github-vault.timer
+
+# Trigger an immediate test run and watch logs
+sudo systemctl start adpbetty-github-vault.service
+sudo journalctl -u adpbetty-github-vault.service -n 100 --no-pager
+
 <div align="center">
   <picture align="center">
     <source media="(prefers-color-scheme: dark)" srcset="media/icons/foundry_local_white.svg">
