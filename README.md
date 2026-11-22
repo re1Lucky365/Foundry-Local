@@ -1,3 +1,170 @@
+Here is how to add deterministic tar.zst archive packaging with matching .sha256 manifests and customizable workspace rules (--forbid-name, --require-path) so your pipeline covers both artifact bundling and stricter repository checks.
+1. Packaging tar.zst Bundles with SHA-256 Checksums (scripts/package_bundle.py)
+This script packages a target directory into a deterministic .tar.zst archive (sorting entries, normalizing timestamps/permissions, and setting mtime=0 for reproducibility) and writes a companion <archive>.sha256 file.
+#!/usr/bin/env python3
+"""Create a deterministic tar.zst archive and companion SHA-256 checksum file."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+from pathlib import Path
+
+EXCLUDED_DIRS = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+
+
+def _reset_tarinfo(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    if info.isdir():
+        info.mode = 0o755
+    elif info.isfile():
+        info.mode = 0o644
+    return info
+
+
+def build_deterministic_tar(source_dir: Path, tar_path: Path) -> None:
+    source_resolved = source_dir.resolve()
+    files_and_dirs: list[tuple[Path, str]] = []
+
+    for current_root, dirnames, filenames in os.walk(source_resolved):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDED_DIRS)
+        filenames.sort()
+
+        current_path = Path(current_root)
+        rel_root = current_path.relative_to(source_resolved)
+
+        if str(rel_root) != ".":
+            files_and_dirs.append((current_path, rel_root.as_posix()))
+
+        for fname in filenames:
+            full_file = current_path / fname
+            if full_file.is_symlink():
+                continue
+            arcname = fname if str(rel_root) == "." else f"{rel_root.as_posix()}/{fname}"
+            files_and_dirs.append((full_file, arcname))
+
+    with tarfile.open(tar_path, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        for src_path, arcname in files_and_dirs:
+            tf.add(src_path, arcname=arcname, recursive=False, filter=_reset_tarinfo)
+
+
+def compress_zst(tar_path: Path, zst_path: Path, level: int = 3) -> None:
+    zst_path.parent.mkdir(parents=True, exist_ok=True)
+    with tar_path.open("rb") as src, zst_path.open("wb") as dst:
+        subprocess.run(
+            ["zstd", f"-{level}", "--force", "--stdout"],
+            stdin=src,
+            stdout=dst,
+            check=True,
+        )
+
+
+def write_sha256_sidecar(artifact_path: Path, checksum_path: Path) -> str:
+    h = hashlib.sha256()
+    with artifact_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    digest = h.hexdigest()
+    checksum_path.write_text(f"{digest}  {artifact_path.name}\n", encoding="utf-8")
+    return digest
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Package deterministic tar.zst bundle + SHA-256.")
+    parser.add_argument("--source", required=True, help="Directory to archive")
+    parser.add_argument("--out", required=True, help="Output .tar.zst path")
+    parser.add_argument("--level", type=int, default=3, help="zstd compression level (1-19)")
+    args = parser.parse_args(argv)
+
+    source_dir = Path(args.source)
+    if not source_dir.is_dir():
+        print(f"[BUNDLE FAIL] Source directory not found: {source_dir}", file=sys.stderr)
+        return 1
+
+    zst_path = Path(args.out)
+    if not zst_path.name.endswith(".tar.zst"):
+        print(f"[BUNDLE FAIL] Output path must end with .tar.zst: {zst_path}", file=sys.stderr)
+        return 1
+
+    checksum_path = Path(f"{zst_path}.sha256")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            raw_tar = Path(tmpdir) / "bundle.tar"
+            build_deterministic_tar(source_dir, raw_tar)
+            compress_zst(raw_tar, zst_path, level=args.level)
+        digest = write_sha256_sidecar(zst_path, checksum_path)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as exc:
+        print(f"[BUNDLE FAIL] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"[BUNDLE OK] archive={zst_path} sha256={digest} sidecar={checksum_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+2. Custom Rules in scripts/local_workspace_audit.py
+Update audit_workspace and main in scripts/local_workspace_audit.py so you can pass repeatable --require-path and --forbid-name flags from the CLI or wrapper script:
+# Add these helper checks inside audit_workspace(root, manifest, required_paths=(), forbidden_names=()):
+    root_resolved = root.resolve()
+
+    for req_rel in required_paths:
+        req_target = (root_resolved / req_rel).resolve()
+        if not req_target.exists():
+            errors.append(f"Missing required workspace path: {req_rel}")
+
+    if forbidden_names:
+        forbidden_set = set(forbidden_names)
+        ignored_dirs = {".git", "__pycache__", ".pytest_cache", ".venv", "venv", "node_modules"}
+        for path in root_resolved.rglob("*"):
+            if any(part in ignored_dirs for part in path.parts):
+                continue
+            if path.name in forbidden_set:
+                errors.append(f"Forbidden workspace item found: {path.relative_to(root_resolved)}")
+
+And in main:
+    parser.add_argument(
+        "--require-path",
+        action="append",
+        default=[],
+        help="Relative path that must exist under --root (repeatable)",
+    )
+    parser.add_argument(
+        "--forbid-name",
+        action="append",
+        default=[],
+        help="File or directory name forbidden under --root (repeatable)",
+    )
+
+3. Wiring Packaging & Verification Together
+chmod +x scripts/package_bundle.py
+
+# 1. Build a checksummed .tar.zst bundle into build/
+python3 scripts/package_bundle.py --source . --out build/workspace_bundle.tar.zst
+
+# 2. Verify the bundle's own SHA-256 sidecar from build/
+(cd build && sha256sum -c workspace_bundle.tar.zst.sha256)
+
+# 3. Run your master pipeline with custom workspace rules
+python3 scripts/local_workspace_audit.py \
+  --root . \
+  --manifest build/SHA256SUMS \
+  --require-path README.md \
+  --forbid-name .DS_Store
+
+Would you like to wire scripts/package_bundle.py directly into scripts/run_master_pipeline.sh behind an optional flag (like --bundle-out), or add tests for the new packaging and custom audit rules?
+yes 
 #!/usr/bin/env bash
 set -euo pipefail
 
