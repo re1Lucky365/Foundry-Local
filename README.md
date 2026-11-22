@@ -1,3 +1,97 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${1:-.}"
+MANIFEST_PATH="${2:-}"
+PROVENANCE_PATH="${3:-}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+mkdir -p "${LOG_DIR}"
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ROOT_DIR}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ROOT_DIR}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/3] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/3] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/3] Running pytest suite..."
+pytest -q
+
+printf '{"timestamp_utc":"%s","root":"%s","status":"PASSED"}\n' \
+  "${TIMESTAMP_UTC}" \
+  "$(cd "${ROOT_DIR}" && pwd)" >> "${LOG_FILE}"
+
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+chmod +x scripts/run_master_pipeline.sh
+bash scripts/run_master_pipeline.sh . build/SHA256SUMS config/provenance.json
+tail -n 5 "${HOME}/.local/state/master_pipeline/pipeline_runs.jsonl"
+A practical "Master System & Pipeline" for a local-first engineering setup is a single, deterministic entry point that runs your validation checks, verifies SHA-256 integrity manifests, runs pytest, and records an auditable local log—without hidden network side effects or overclaimed automation. (This is general software engineering guidance, not legal or security advice.)
+1. Unified Local Master Runner (scripts/run_master_pipeline.sh)
+This shell script executes your workspace audit, clean pipeline/provenance guard, and pytest suite in order, writing a timestamped JSON-lines summary to a local log directory while failing closed (set -euo pipefail) if any check fails.
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="${1:-.}"
+MANIFEST_PATH="${2:-}"
+PROVENANCE_PATH="${3:-}"
+LOG_DIR="${PIPELINE_LOG_DIR:-${HOME}/.local/state/master_pipeline}"
+TIMESTAMP_UTC="$(date -u +"%Y-%m-%dT%H-%M-%SZ")"
+LOG_FILE="${LOG_DIR}/pipeline_runs.jsonl"
+
+mkdir -p "${LOG_DIR}"
+
+AUDIT_CMD=(python3 scripts/local_workspace_audit.py --root "${ROOT_DIR}")
+if [[ -n "${MANIFEST_PATH}" ]]; then
+  AUDIT_CMD+=(--manifest "${MANIFEST_PATH}")
+fi
+
+GUARD_CMD=(python3 scripts/clean_pipeline_guard.py --root "${ROOT_DIR}")
+if [[ -n "${PROVENANCE_PATH}" ]]; then
+  GUARD_CMD+=(--provenance "${PROVENANCE_PATH}")
+fi
+
+echo "[1/3] Running local workspace & manifest audit..."
+"${AUDIT_CMD[@]}"
+
+echo "[2/3] Running clean pipeline & provenance guard..."
+"${GUARD_CMD[@]}"
+
+echo "[3/3] Running pytest suite..."
+pytest -q
+
+printf '{"timestamp_utc":"%s","root":"%s","status":"PASSED"}\n' \
+  "${TIMESTAMP_UTC}" \
+  "$(cd "${ROOT_DIR}" && pwd)" >> "${LOG_FILE}"
+
+echo "Master pipeline passed. Logged to ${LOG_FILE}"
+
+2. How to Run & Verify It
+ * Make the script executable:
+   chmod +x scripts/run_master_pipeline.sh
+
+ * Run against your repository root (and optionally pass a SHA256SUMS manifest and provenance.json):
+   bash scripts/run_master_pipeline.sh . build/SHA256SUMS config/provenance.json
+
+ * Inspect the append-only run log:
+   tail -n 5 "${HOME}/.local/state/master_pipeline/pipeline_runs.jsonl"
+
+3. Guardrails for Multi-Stage & Cross-Repo Pipelines
+ * Explicit over implicit: Pass paths, remotes, and flags explicitly rather than relying on silent background changes or unverified external endpoints.
+ * Immutable, checksummed artifacts: Pair every archive or release bundle (such as tar.zst) with a sha256sum manifest and verify it before moving files to backup or mirror targets.
+ * Honest boundaries: Keep sensitive records, credentials, and real personal data out of Git repositories, and treat any simulated or synthetic outputs strictly as test artifacts.
+
 [Unit]
 Description=adpBetty GitHub Mirror, Zstd Seal, and Vault Verification
 After=network-online.target
